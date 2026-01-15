@@ -275,9 +275,21 @@ class Pipe(SimpleHeatExchanger):
             dependents=self.ohc_subsurface_group_dependents,
             description="equation for heat loss of buried pipes"
         )
+        parameters['Q_ohc_group_surface_fix_insulation']=dc_gcp(
+            elements=[
+                'insulation_cross_sec_area', 'insulation_tc', 'Tamb', 'material',
+                'pipe_thickness', 'environment_media','wind_velocity'
+            ],
+            num_eq_sets=1,
+            func=self.ohc_surface_csa_group_func,
+            dependents=self.ohc_surface_csa_group_dependents
+        )
         parameters['insulation_thickness']=dc_cp(
             min_val=1e-3, max_val=1e1, quantity="length",
             description="thickness of pipe insulation"
+        )
+        parameters['insulation_cross_sec_area']=dc_cp(
+            min_val=1e-3, max_val=1e2, quantity="area"
         )
         parameters['insulation_tc']=dc_cp(
             min_val=1e-3, max_val=1e2, quantity="thermal_conductivity",
@@ -406,7 +418,122 @@ class Pipe(SimpleHeatExchanger):
             + [var for c in self.inl + self.outl for var in [c.p, c.h]]
             + [self.D, self.L]
         )
+    def ohc_surface_csa_group_func(self):
+        r"""Heat transfer calculation based on pipe material, insulation and
+        surrounding ambient conditions fur surface pipes.
+        Valid for forced convection.
 
+        Returns
+        -------
+        float
+            Residual value of equation
+
+            .. math::
+
+                0 = \dot m \cdot \left(h_\text{out}-h_\text{in}\right)-
+                \Delta T_\text{log} \cdot A \cdot U
+
+                U = R_\text{conductance} + \frac{1}{\alpha_\text{outer}}}
+
+                \alpha_\text{outer} = \frac{Nu_\text{l} \cdot \lambda}{l}
+
+                Nu_\text{l}= 0.3 + \sqrt{Nu_\text{l, lam}^{2} +
+                Nu_\text{l, turb}^{2}}
+
+                Nu_\text{l, turb} = \frac{0.037 Re_l^{0.8} \cdot
+                Pr}{1+2.443 \cdot Re_l^{-0.1}\cdot (Pr^{2/3}-1)}
+
+                Nu_\text{l, lam} = 0.664 \sqrt{Re_l}\cdot \sqrt[3]{Pr}
+
+        Reference: :cite:`gnielinski1975`
+        """
+        
+        
+                
+        diameters= [
+            self.D.val_SI,
+            self.D.val_SI + 2 * self.pipe_thickness.val_SI,
+            2* (self.insulation_cross_sec_area.val_SI / math.pi  +( self.D.val_SI/2 + self.pipe_thickness.val_SI )**2
+                )**0.5
+            #self.D.val_SI + 2 * self.pipe_thickness.val_SI + 2 * self.insulation_thickness.val_SI
+        ]
+        
+        #self.set_attr(insulation_thickness = (
+        self.insulation_thickness.val = (
+           diameters[2] - diameters[1]
+            )/2
+        #print(self.insulation_thickness.val)
+        # outer surface area per definition
+        area = self.L.val_SI * math.pi * diameters[2]
+
+        # heat transfer resistance
+        R_sum = []
+
+        '''
+        inner heat transfer resistance neglected yet
+        R_int = 1/alpha_i *Diameters[2]/ Diameters[0]
+        R_sum.append(R_int)
+        '''
+
+        # pipe wall heat transfer resistance
+        pipe_tc ={
+            'Steel':46.5, 'Carbon Steel':46, 'Cast Iron':48.8,
+            'Stainless Steel':21, 'PVC':0.23, 'Copper': 380
+        }
+        if diameters[1] > diameters[0]:
+            if isinstance(self.material.val, str):
+                wall_conductivity = pipe_tc[self.material.val]
+            else:
+                wall_conductivity = self.material.val
+            R_sum.append(
+                diameters[1] / wall_conductivity
+                * math.log(diameters[1] / diameters[0]) / 2
+            )
+
+        # insulation heat transfer resistance
+        if self.insulation_thickness.val_SI != 0:
+            R_sum.append(
+                diameters[2] / self.insulation_tc.val_SI
+                * math.log(diameters[2] / diameters[1]) / 2
+            )
+        # external heat transfer resistance (to environment)
+        Re = (
+            self.wind_velocity.val_SI * math.pi / 2
+            * diameters[2]
+            / self.air.viscosity_pT(101300, self.Tamb.val_SI)
+            * self.air.d_pT(101300, self.Tamb.val_SI)
+        )
+        Pr = self.air.AS.Prandtl()
+        Nu_lam = 0.664 * Re ** 0.5 *Pr ** (1 / 3)
+        Nu_turb = (
+            0.037 * Re ** 0.8 * Pr
+            / (1+ 2.443 * Re** (-0.1) * (Pr ** (2 / 3) - 1))
+        )
+        Nu_ext = 0.3 + (Nu_lam ** 2 + Nu_turb ** 2) ** 0.5
+        alpha_ext = (
+            Nu_ext
+            / (math.pi / 2 * diameters[2])
+            * self.air.AS.conductivity()
+        ) #W/m²/K
+        R_sum.append(1 / alpha_ext)
+
+        if len(R_sum) == 0:
+            raise ValueError("No heat transfer resistance. Check input values.")
+
+        i = self.inl[0]
+        o = self.outl[0]
+
+        return (
+            i.m.val_SI * (o.h.val_SI - i.h.val_SI)
+            + area / sum(R_sum) * self._calculate_td_log()
+        )
+
+    def ohc_surface_csa_group_dependents(self):
+        return (
+            [self.inl[0].m]
+            + [var for c in self.inl + self.outl for var in [c.p, c.h]]
+            + [self.D]
+        )
     def ohc_subsurface_group_func(self):
         r"""Heat transfer calculation based on pipe material, insulation and
         surrounding ambient conditions for subsurface pipes.
